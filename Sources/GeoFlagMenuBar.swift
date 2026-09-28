@@ -19,8 +19,11 @@ final class GeoFetcher {
         cfg.timeoutIntervalForRequest = 5
         cfg.timeoutIntervalForResource = 8
         cfg.waitsForConnectivity = false
+        cfg.urlCache = nil
         return URLSession(configuration: cfg)
     }()
+    // One shared queue instead of a new DispatchQueue per poll cycle.
+    private let mergeQueue = DispatchQueue(label: "geo.merge")
 
     func fetch(completion: @escaping (GeoInfo) -> Void) {
         // Several endpoints, first success wins; if all fail -> offline mark.
@@ -29,39 +32,39 @@ final class GeoFetcher {
             "https://ifconfig.co/json",
             "https://api.myip.com",
         ]
-        var results: [GeoInfo] = []
+        var results: [(idx: Int, info: GeoInfo)] = []
         results.reserveCapacity(endpoints.count)
         let group = DispatchGroup()
-        let q = DispatchQueue(label: "geo.merge")
         for (idx, ep) in endpoints.enumerated() {
             group.enter()
-            session.dataTask(with: URL(string: ep)!) { data, _, error in
+            session.dataTask(with: URL(string: ep)!) { [mergeQueue] data, _, error in
                 defer { group.leave() }
                 guard error == nil, let data = data,
                       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
                 let ip = (obj["ip"] as? String)
                     ?? (obj["ip_addr"] as? String)
                     ?? "?"
-                // Both ISO-2 ("RU") and language-style ("en") variants handled.
+                // Field names differ per service: "country"/"country_iso" (ipinfo, ifconfig.co),
+                // "country"/"cc" (api.myip.com). Full names ("United States") resolve via ISO field.
                 var country = (obj["country"] as? String)
                     ?? (obj["country_iso"] as? String)
+                    ?? (obj["cc"] as? String)
                     ?? "?"
-                let city = (obj["city"] as? String) ?? ""
-                // api.myip.com returns full name; use "country_iso" if present else map later.
-                if country.count > 2, let iso = obj["country_iso"] as? String { country = iso }
+                if country.count != 2 {
+                    let iso = (obj["country_iso"] as? String) ?? (obj["cc"] as? String)
+                    if let iso = iso { country = iso }
+                }
                 if country.count != 2 { return }
+                let city = (obj["city"] as? String) ?? ""
                 let info = GeoInfo(ip: ip, country: country, flag: Self.flagEmoji(country), city: city,
                                    changed: false, isFallback: false)
-                q.sync { results.append(info) }
-                // Prefer the earlier endpoint when it responds.
-                if idx == 0 {
-                    q.sync { results.sort { $0.ip <= $1.ip } }
-                }
+                mergeQueue.sync { results.append((idx, info)) }
             }.resume()
         }
         group.notify(queue: .main) {
-            if let first = results.first {
-                completion(first)
+            // Earliest endpoint wins when several answer; order is arrival-agnostic.
+            if let best = results.min(by: { $0.idx < $1.idx })?.info {
+                completion(best)
             } else {
                 var off = GeoInfo()
                 off.ip = "оффлайн"
@@ -126,6 +129,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var lastRefresh: Date?
     var timer: Timer?
     var isOffline = false
+    // DateFormatter is expensive to build; create once, reuse forever.
+    let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -171,7 +180,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ConnectivityMonitor.shared.start()
 
         checkNow()
+        // Tolerance lets the OS coalesce this wake-up with others -> better battery.
         timer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in self?.scheduleCheck() }
+        timer?.tolerance = 2
     }
 
     @objc func scheduleCheck() {
@@ -191,16 +202,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let changed = (info.ip, info.country) != lastSignature
         if changed { lastSignature = (info.ip, info.country) }
         if let btn = statusItem.button {
-            btn.title = info.changed ? "\(info.flag) " : "\(info.flag)"
             btn.title = "\(info.flag)"
         }
         ipItem.title = "IP: \(info.ip)"
         countryItem.title = "Страна: \(info.country) \(info.flag)"
         cityItem.title = "Город: \(info.city.isEmpty ? "—" : info.city)"
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm:ss"
-        refreshedItem.title = "Обновлено: \(f.string(from: lastRefresh!))" + (changed ? "  (изменилось!)" : "")
-        // Simple attention: bounce title color via alternateTitle not needed; log to console.
+        refreshedItem.title = "Обновлено: \(timeFormatter.string(from: lastRefresh!))" + (changed ? "  (изменилось!)" : "")
         if changed && lastSignature.0 != "" { NSLog("[GeoFlag] changed -> %@ (%@)", info.ip, info.country) }
     }
 
